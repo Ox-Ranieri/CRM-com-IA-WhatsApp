@@ -17,11 +17,14 @@ import type { EventRow, HandlerResult } from "@/lib/event-log/dispatcher";
 import { deriveMediaText, type DeriveDeps } from "@/lib/messaging/media/derive";
 import { TIPOS_DERIVAVEIS } from "@/lib/messaging/media/derivable";
 import { deriveVideoText } from "@/lib/messaging/media/video-derive";
-import { apiTranscriptionProvider } from "@/lib/messaging/media/transcription";
+import {
+  apiTranscriptionProvider,
+  idiomasDaTranscricao,
+  modeloDeTranscricaoEmVigor,
+} from "@/lib/messaging/media/transcription";
 import { logger } from "@/lib/logger";
 import { createAdminClient } from "@/lib/supabase/admin";
-import { assertDestinoResolvidoSeguro } from "@/lib/automation/outbound-ip";
-import { assertSafeOutboundUrl } from "@/lib/automation/outbound-url";
+import { motivoDaRecusaDeDestino } from "@/lib/automation/destinos-internos-autorizados";
 import { DETALHE_TECNICO } from "@/lib/event-log/aviso-de-evento-morto";
 
 export const MEDIA_DERIVE_CONSUMER_KEY = "media_derive_v1";
@@ -64,7 +67,20 @@ export async function deriveMessageMedia(row: EventRow): Promise<HandlerResult> 
   if (error) return { consumer_key, status: "error", detail: error.message };
 
   const msg = data as MessageRow | null;
-  if (!msg?.media_storage_path) return { consumer_key, status: "skipped", detail: "no media" };
+  if (!msg) return { consumer_key, status: "skipped", detail: "no media" };
+
+  // Desistir DE PROPÓSITO grava `skipped` (terminal em DERIVACAO_TERMINADA).
+  // Sem a marca, a linha ficava com status null para sempre e o drain do turno,
+  // que espera a mídia da CONVERSA, segurava a resposta do texto seguinte até o
+  // teto de 120s por uma leitura que nunca ia acontecer.
+  const markSkipped = async (detail: string): Promise<HandlerResult> => {
+    await admin.from("messages")
+      .update({ media_derived_status: "skipped" })
+      .eq("id", msg.id).eq("organization_id", msg.organization_id);
+    return { consumer_key, status: "skipped", detail };
+  };
+
+  if (!msg.media_storage_path) return markSkipped("no media");
   if (msg.media_derived_status === "ready") return { consumer_key, status: "skipped", detail: "already derived" };
   if (!TIPOS_DERIVAVEIS.has(msg.type)) return { consumer_key, status: "skipped", detail: `type ${msg.type}` };
   // Vídeo é opt-in (custo: ffmpeg + N chamadas de visão): só deriva se algum agente
@@ -78,7 +94,7 @@ export async function deriveMessageMedia(row: EventRow): Promise<HandlerResult> 
       .eq("video_frames_enabled", true)
       .limit(1)
       .maybeSingle();
-    if (!flag) return { consumer_key, status: "skipped", detail: "video_frames_disabled" };
+    if (!flag) return markSkipped("video_frames_disabled");
   }
 
   /** O que o operador chama de "isto" — o aviso não pode falar em `msg.type`. */
@@ -125,7 +141,6 @@ export async function deriveMessageMedia(row: EventRow): Promise<HandlerResult> 
       openrouterApiKey: process.env.OPENROUTER_API_KEY,
       cacheTtl: "1h",
     };
-    let llm = await resolveOrgLlmConfig(derivePool(), llmCfg, row.organization_id);
 
     // ─── O painel de provedores manda AQUI também ────────────────────────────
     //
@@ -137,6 +152,12 @@ export async function deriveMessageMedia(row: EventRow): Promise<HandlerResult> 
     // modelo padrão. É textualmente a classe de defeito que
     // `lib/ai/gateway-binding.ts` declara ter vindo matar — três pontos foram
     // fechados e este ficou igual.
+    //
+    // ⚠️ Resolver primeiro o padrão da organização falha quando a org não tem
+    // credencial padrão (ex.: onboarding com google/gemini sem chave), mesmo com
+    // `visao_de_imagem` configurado e ativo com OpenAI/Anthropic (#1591). Por
+    // isso, tentamos primeiro o binding de visão; se ele não existir ou falhar,
+    // caímos no padrão da organização.
     const bindingDaVisao = await lerBindingDoPonto(admin, row.organization_id, "visao_de_imagem");
     // A `base_url` do binding de visão, para descer até o factory do provedor.
     //
@@ -150,6 +171,8 @@ export async function deriveMessageMedia(row: EventRow): Promise<HandlerResult> 
     // binding funcionava no chat. Um caminho só: a base_url lida aqui é a mesma
     // que o turno usa.
     let baseUrlDaVisao: string | null = null;
+    let llm: Awaited<ReturnType<typeof resolveOrgLlmConfig>> | null = null;
+
     if (bindingDaVisao) {
       try {
         const comBinding = await resolveOrgLlmConfig(derivePool(), llmCfg, row.organization_id, {
@@ -170,6 +193,10 @@ export async function deriveMessageMedia(row: EventRow): Promise<HandlerResult> 
           error: err instanceof Error ? err.message : String(err),
         });
       }
+    }
+
+    if (!llm) {
+      llm = await resolveOrgLlmConfig(derivePool(), llmCfg, row.organization_id);
     }
 
     // A transcrição é SEMPRE do Whisper (api.openai.com), então precisa de uma
@@ -204,13 +231,18 @@ export async function deriveMessageMedia(row: EventRow): Promise<HandlerResult> 
     // não tem nada a dizer sobre isso: ele recusa destino INTERNO, e este caso é
     // um destino externo perfeitamente público.
     //
-    // Enquanto o dono do produto não decide a regra (documento de decisão 22),
-    // a triagem escolhe o desfecho conservador: com endereço da organização e
-    // chave da instalação, a leitura é RECUSADA com aviso na Central, em vez de
-    // a chave sair. Quem cadastra a credencial da própria empresa segue
-    // funcionando — que é o caminho que o produto já oferece na mesma tela.
-    const chaveEhDaInstalacao = [llmCfg.anthropicApiKey, llmCfg.openaiApiKey, llmCfg.openrouterApiKey]
-      .some((k) => typeof k === "string" && k !== "" && k === llm.apiKey);
+    // Decisão 22-a do dono do produto: endereço próprio exige chave própria.
+    // Com endereço da organização e chave da instalação, a leitura é RECUSADA
+    // com aviso na Central, em vez de a chave sair. Quem cadastra a credencial
+    // da própria empresa segue funcionando — que é o caminho que o produto já
+    // oferece na mesma tela. O turno do agente aplica o mesmo corte no seam
+    // (`run-model-call.ts`).
+    //
+    // A origem vem do RESOLVEDOR, que é quem sabe qual degrau da escada
+    // escolheu a chave. Até aqui ela era deduzida comparando o plaintext com as
+    // chaves do `.env` — uma segunda cópia da escada, que o chat não tinha e que
+    // divergiria no primeiro degrau novo.
+    const chaveEhDaInstalacao = llm.origemDaChave === "chave_da_instalacao";
 
     // O 5º argumento é a `base_url` do binding: o factory precisa dela para não
     // cair no endpoint padrão do provedor (ver o comentário lá em cima).
@@ -398,12 +430,12 @@ function buildDeriveDeps(
       return MARCADOR_NAO_LIDA;
     }
     if (baseUrlDaVisao) {
-      const recusa = await motivoDaRecusaDeDestino(baseUrlDaVisao);
+      const recusa = await motivoDaRecusaDeDestino(baseUrlDaVisao, "organizacao");
       if (recusa) {
         await avisarMidiaNaoLida(
           orgId,
           "imagem",
-          "o endereço configurado para a visão não foi aceito como destino, então não enviei a imagem nem a chave para lá — confira o endereço do provedor em Agente de IA e Provedores",
+          "o endereço configurado para a visão não foi aceito como destino, então não enviei a imagem nem a chave para lá — confira o endereço do provedor em Agente de IA e Provedores; endereço escolhido pela empresa não pode apontar para a rede interna do servidor",
           undefined,
           recusa,
         );
@@ -449,8 +481,22 @@ function buildDeriveDeps(
   // `model`, e o worker nunca os passava: quem tinha Groq/Whisper próprio
   // continuava batendo em api.openai.com com `whisper-1`. Sem
   // `TRANSCRIPTION_API_KEY` o comportamento é exatamente o de antes.
+  //
+  // `TRANSCRIPTION_MODEL` e `TRANSCRIPTION_LANGUAGES` valem TAMBÉM aqui, com a
+  // chave da OpenAI da organização: trocar `whisper-1` por um modelo melhor da
+  // própria OpenAI não pode exigir copiar a chave para o `.env`. O MODELO só
+  // vale aqui com `TRANSCRIPTION_BASE_URL` vazio (ver `modeloDeTranscricaoEmVigor`).
+  const idiomas = idiomasDaTranscricao(env.TRANSCRIPTION_LANGUAGES);
   const transcricaoPadrao: DeriveDeps["transcriber"] = openaiKey
-    ? apiTranscriptionProvider({ apiKey: openaiKey })
+    ? apiTranscriptionProvider({
+        apiKey: openaiKey,
+        model: modeloDeTranscricaoEmVigor({
+          model: env.TRANSCRIPTION_MODEL,
+          apiKey: env.TRANSCRIPTION_API_KEY,
+          baseUrl: env.TRANSCRIPTION_BASE_URL,
+        }),
+        languages: idiomas,
+      })
     : semTranscricao;
   // O endereço do serviço de transcrição vem do .env da instalação e a chamada
   // leva a chave no cabeçalho: mesma recusa do endereço da visão, e antes de a
@@ -461,13 +507,13 @@ function buildDeriveDeps(
     transcribe: async (audio, mime) => {
       const enderecoDoServico = env.TRANSCRIPTION_BASE_URL;
       const recusa = enderecoDoServico
-        ? await motivoDaRecusaDeDestino(enderecoDoServico)
+        ? await motivoDaRecusaDeDestino(enderecoDoServico, "instalacao")
         : null;
       if (recusa) {
         await avisarMidiaNaoLida(
           orgId,
           "áudio",
-          "o endereço configurado para a transcrição não foi aceito como destino, então não enviei o áudio nem a chave para lá — confira TRANSCRIPTION_BASE_URL",
+          "o endereço configurado para a transcrição não foi aceito como destino, então não enviei o áudio nem a chave para lá — confira TRANSCRIPTION_BASE_URL; se o serviço roda na rede interna, quem administra a instalação libera o endereço em Administração › Destinos internos",
           undefined,
           recusa,
         );
@@ -489,6 +535,7 @@ function buildDeriveDeps(
           apiKey: chaveDeTranscricao,
           baseUrl: env.TRANSCRIPTION_BASE_URL || undefined,
           model: env.TRANSCRIPTION_MODEL || undefined,
+          languages: idiomas,
         }),
       )
     : transcricaoPadrao;
@@ -540,25 +587,6 @@ export function textoDoAvisoDeMidiaNaoLida(aviso: {
       `Para resolver, ajuste o modelo desse ponto em Agente de IA → Provedores, ou cadastre a chave necessária em Credenciais.` +
       (aviso.detalheTecnico ? ` ${DETALHE_TECNICO} ${aviso.detalheTecnico}` : ""),
   };
-}
-
-/**
- * O motivo pelo qual um endereço configurado pela instalação não pode receber
- * a mídia — e a credencial da instalação que a acompanha —, ou null quando
- * pode.
- *
- * São os MESMOS dois guardas que as saídas de webhook já aplicam, na mesma
- * ordem: o textual julga de graça o que dá para julgar sem rede, e o de DNS
- * paga a resolução para julgar o IP por trás do nome.
- */
-async function motivoDaRecusaDeDestino(endereco: string): Promise<string | null> {
-  try {
-    assertSafeOutboundUrl(endereco);
-    await assertDestinoResolvidoSeguro(new URL(endereco).hostname);
-    return null;
-  } catch (err) {
-    return err instanceof Error ? err.message : String(err);
-  }
 }
 
 async function avisarMidiaNaoLida(

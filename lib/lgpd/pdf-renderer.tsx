@@ -112,7 +112,7 @@ function fmtMoney(cents: number | null | undefined, currency: string | null | un
 
 /**
  * A MESMA cadeia que `lib/lgpd/sla-alarm.ts:93` já usa
- * (`organizationDpoEmail || env.LGPD_DPO_EMAIL`). Reusar a ordem, e não
+ * (organização acima, instalação abaixo — resolvida pelo coletor). Reusar a ordem, e não
  * inventar outra, é o que impede o documento e o alarme de apontarem para
  * encarregados diferentes na mesma organização.
  *
@@ -120,7 +120,11 @@ function fmtMoney(cents: number | null | undefined, currency: string | null | un
  * não-resposta num campo cuja função é dizer a quem o titular reclama.
  */
 function encarregado(data: ExportPayload): string {
-  return data.dpo_email || env.LGPD_DPO_EMAIL || "não informado pelo controlador";
+  // O renderizador não consulta configuração: ele desenha o que recebeu. Quem
+  // resolve o encarregado (organização acima, instalação abaixo) é o coletor,
+  // que é assíncrono e já busca `dpo_email` da organização. Deixar a busca aqui
+  // obrigaria um componente de PDF a falar com o banco no meio do desenho.
+  return data.dpo_email || "não informado pelo controlador";
 }
 
 // Concluir o processamento do job não comprova envio: ele também pode terminar
@@ -208,7 +212,11 @@ export function LgpdExportPdf({ data, unsignedWarning }: Props): React.ReactElem
             <View style={styles.row}>
               <Text style={styles.label}>{data.documento_rotulo}:</Text>
               <Text style={styles.value}>
-                {data.contact.cpf_present ? "Armazenado (criptografado)" : "—"}
+                {data.contact.cpf_present
+                  ? "Armazenado (criptografado)"
+                  : data.contact.cpf_informado_na_conversa
+                    ? "Informado na conversa (valor no arquivo de dados)"
+                    : "—"}
               </Text>
             </View>
             <View style={styles.row}>
@@ -223,6 +231,21 @@ export function LgpdExportPdf({ data, unsignedWarning }: Props): React.ReactElem
               <Text style={styles.label}>Anonimizado:</Text>
               <Text style={styles.value}>{data.contact.is_anonymized ? "Sim" : "Não"}</Text>
             </View>
+          </View>
+        ) : null}
+
+        {/* Respostas e campos personalizados (roteiros de atendimento, etc.) */}
+        {data.contact && (data.contact.campos_legiveis ?? []).length > 0 ? (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>Respostas e campos personalizados</Text>
+            {/* A pergunta em linha própria: rótulo de roteiro é frase, e na coluna
+                de 110pt dos dados fixos ele quebrava no meio da palavra. */}
+            {data.contact.campos_legiveis.map((campo, i) => (
+              <View key={i} style={styles.itemBlock}>
+                <Text style={styles.small}>{campo.rotulo}</Text>
+                <Text>{campo.valor}</Text>
+              </View>
+            ))}
           </View>
         ) : null}
 

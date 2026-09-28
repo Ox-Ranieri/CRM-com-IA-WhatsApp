@@ -9,6 +9,11 @@
 #
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
+# Um GIT_DIR herdado (suíte rodada de dentro de um hook ou de um `rebase --exec`)
+# manda por cima de todo `cd`/`git -C` dos repositórios descartáveis abaixo, e a
+# escrita cai no repositório de quem roda. Zerar o ambiente local do git é o
+# idioma canônico do próprio git para isso.
+unset $(git rev-parse --local-env-vars)
 
 # O _common.sh vem antes porque é dele que saem `nome_do_projeto_compose`,
 # `veredito_rede_do_proxy` e `garantir_rede_do_proxy` — o install.sh e o update.sh
@@ -31,6 +36,27 @@ INSTALL_SH_LIB=1 . ./install.sh
 set +e   # os dois ligam `set -e`; aqui esperamos validadores falharem de propósito
 
 fail=0
+
+# ── Sandbox de CHAVES DE IA: o ambiente de quem roda é uma SEGUNDA fonte que o
+# install.sh lê — e este caso instala SEM chave (issue #1570) ────────────────
+# `pendencia_da_ia` (install.sh:2012) decide o aviso da tela final lendo
+# AI_GATEWAY_API_KEY e a chave do provedor DIRETO DO AMBIENTE, não só do .env;
+# o caso "instalar SEM chave de IA" limpava apenas o .env (grep -v abaixo) e
+# deixava o ambiente de quem roda decidir o veredito. Medido em 24/09/2026: com
+# AI_GATEWAY_API_KEY exportada, a suíte reprova com a MESMA mensagem do run
+# 35948236372 — `✗ a tela final não avisa
+# que a IA ainda não atende`, 1 de 1 — porque o install grava a chave herdada
+# de volta no .env (`envq AI_GATEWAY_API_KEY`, install.sh:1702) e nenhum
+# assertion daqui cobra o gateway. Os outros três nomes contaminam ANTES:
+# ANTHROPIC_API_KEY → 2 vermelhos (provedor + `veio com valor`), OPENAI_API_KEY
+# → 2, OPENROUTER_API_KEY → 3 (contamina o AI_PROVIDER na entrevista).
+# Zerando as quatro aqui, TODO caso nasce sem chave e cada caso decide as
+# chaves que quer pelo .env que escreve — mesma hermetização que a linha
+# `SUPABASE_ACCESS_TOKEN=` já faz por chamada lá embaixo.
+# O passo do CI não exporta chave de IA (env: só VERIFY_INICIO e PNPM_HOME) e o
+# mesmo SHA passou na re-execução: isto hermetiza a suíte para quem roda com
+# chave no terminal, mas não é a causa da intermitência da #1570, que segue aberta.
+export ANTHROPIC_API_KEY= OPENAI_API_KEY= OPENROUTER_API_KEY= AI_GATEWAY_API_KEY=
 
 # ── Sandbox: a suíte NÃO pode escrever no crontab da máquina de quem a roda ──
 # Não é hipótese: os testes JÁ sujaram o crontab do mantenedor com 10 linhas
@@ -402,7 +428,7 @@ TMP3="$(mktemp -d)"
 (
   MARCA="$TMP3/executou"
   mkdir -p "$TMP3/bin" "$TMP3/proj"
-  cp install.sh _common.sh "$TMP3/"
+  cp install.sh _common.sh _i18n.sh "$TMP3/"
   : > "$TMP3/proj/docker-compose.prod.yml"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP3/bin/docker"; chmod +x "$TMP3/bin/docker"
   dublar_uname_amd64 "$TMP3/bin"
@@ -453,7 +479,8 @@ if [ ! -f "$EXEMPLO" ]; then
   # pulo silencioso é indistinguível de teste que passou.
   printf '  — pulado: %s não existe (kit fora do repositório)\n' "$EXEMPLO"
 else
-  GRAVA="$(grep -oE '^[[:space:]]*envq [A-Z_0-9]+' install.sh | awk '{print $2}' | sort -u)"
+  regua_quebrou=0
+  GRAVA="$(grep -oE '^[[:space:]]*envq [A-Z_0-9]+' install.sh | awk '{print $2}' | sort -u)" || regua_quebrou=1
   # VACUIDADE — a lista de escrita é a régua deste caso, e uma régua CURTA acusa
   # o inocente. `$GRAVA` sai de um pipeline de três estágios; quando a máquina
   # está saturada ele às vezes volta truncado, e o efeito não é um teste que
@@ -466,21 +493,38 @@ else
   # rodadas seguintes verdes. Conjuntos diferentes a cada vez é a assinatura de
   # régua truncada, não de defeito.
   #
-  # O piso não precisa acompanhar o crescimento do install.sh: ele separa
-  # "pipeline morreu no meio" de "lista completa", e qualquer valor bem abaixo do
-  # real serve. Para ver quantas há hoje:
-  #   grep -cE '^[[:space:]]*envq [A-Z_0-9]+' hostgator-setup-kit/install.sh
+  # O piso fixo de 30 não pegava isso: 30 é menos da metade da régua real, e a
+  # truncagem parcial (67 → 40, digamos) passava por baixo da guarda e saía como
+  # acusação. Piso escolhido à mão ainda encolhe de valor relativo a cada chave
+  # nova, sem avisar. O que separa "régua truncada" de "chave faltando" é contar
+  # a MESMA régua duas vezes, por caminhos independentes: a lista acima e uma
+  # contagem direta no install.sh, de um processo só — sem pipeline, logo sem
+  # leitura parcial. Batendo, a régua está inteira e as acusações abaixo têm
+  # chão; divergindo, ou voltando o pipeline acima com status ≠ 0, o desfecho é
+  # INCONCLUSIVO — nunca "chave faltando". A contagem direta é por CHAVE ÚNICA,
+  # como a lista: `envq DOMAIN` escrito em dois ramos de um `if` é uma chave só,
+  # e contar linhas acusaria régua truncada para sempre com a régua inteira.
+  #
+  # A contagem dupla fecha a truncagem, mas não era ela a causa das acusações
+  # soltas da issue #1153: as rodadas registradas acusaram uma ou duas chaves
+  # espalhadas, e uma régua truncada perde a CAUDA — para deixar de fora aquelas
+  # chaves teria de acusar de 14 a 54 ao mesmo tempo. O que produz uma acusação
+  # solta é a checagem POR CHAVE, que era um `printf | grep -qx` por chave: um
+  # processo por chave, que pode falhar sozinho sob carga, lido pelo `&&` como
+  # "ausente" para QUALQUER status ≠ 0. `na_regua` responde a pertença sem abrir
+  # processo nenhum. Qual falha do sistema devolvia o status ≠ 0 não foi medido
+  # (carga ~17: 0 em 6000); o conserto não depende de saber.
+  na_regua() { case $'\n'"$GRAVA"$'\n' in *$'\n'"$1"$'\n'*) return 0 ;; esac; return 1; }
   n_grava="$(printf '%s\n' "$GRAVA" | grep -c . || true)"
-  if [ "${n_grava:-0}" -lt 30 ]; then
-    printf '  ✗ a lista de escrita voltou com %s chave(s) — a régua está truncada, não o install.sh\n' "${n_grava:-0}"
+  n_real="$(awk 'match($0, /^[[:space:]]*envq [A-Z_0-9]+/) { k = substr($0, RSTART, RLENGTH); sub(/^[[:space:]]*envq /, "", k); u[k] = 1 } END { n = 0; for (k in u) n++; print n }' install.sh)" || regua_quebrou=1
+  if [ "${regua_quebrou:-0}" -ne 0 ] || [ "${n_grava:-0}" -ne "${n_real:-0}" ]; then
+    printf '  ✗ a lista de escrita voltou com %s chave(s) contra %s na contagem direta — a régua está truncada, não o install.sh\n' "${n_grava:-0}" "${n_real:-0}"
     printf '     (cenário INCONCLUSIVO: sem régua inteira, toda acusação abaixo seria falsa)\n'
     fail=1
-    GRAVA=""
-    novas=""
   else
   novas=""
   for k in $(grep -oE '^[A-Z_0-9]+=' "$EXEMPLO" | tr -d '=' | sort -u); do
-    printf '%s\n' "$GRAVA" | grep -qx "$k" && continue
+    na_regua "$k" && continue
     case " $DIVIDA " in *" $k "*) continue ;; esac
     novas="$novas $k"
   done
@@ -491,16 +535,18 @@ else
   else
     printf '  ✓ nenhuma chave nova fora da lista de escrita\n'
   fi
-  fi
+  # Só com a régua inteira: no ramo inconclusivo, conferir a dívida contra uma
+  # régua que não temos imprimiria um ✓ calculado sobre nada.
   estagnada=""
   for k in $DIVIDA; do
-    printf '%s\n' "$GRAVA" | grep -qx "$k" && estagnada="$estagnada $k"
+    na_regua "$k" && estagnada="$estagnada $k"
   done
   if [ -n "$estagnada" ]; then
     printf '  ✗ já é gravada pelo install.sh — tire da lista DÍVIDA deste teste:%s\n' "$estagnada"
     fail=1
   else
     printf '  ✓ dívida ainda condiz (%s chaves conhecidas, só pode encolher)\n' "$(printf '%s' "$DIVIDA" | wc -w | tr -d ' ')"
+  fi
   fi
 fi
 
@@ -522,6 +568,10 @@ sim_ok "sim por extenso"         sim "sim"
 sim_ok "SIM em caixa alta"       sim "SIM"
 sim_ok "y (teclado em inglês)"   sim "y"
 sim_ok "yes"                     sim "yes"
+sim_ok "si (español)"            sim "si"
+sim_ok "sí com acento"           sim "sí"
+sim_ok "Sí maiúsculo"            sim "Sí"
+sim_ok "SÍ em caixa alta"        sim "SÍ"
 sim_ok "espaço em volta"         sim "  s  "
 sim_ok "Enter (vazio) é não"     nao ""
 sim_ok "n"                       nao "n"
@@ -547,6 +597,7 @@ gemea_ok() {  # gemea_ok <arquivo> <entrada> <sim|nao>
 for arquivo in install.sh _common.sh; do
   gemea_ok "$arquivo" "S"      sim
   gemea_ok "$arquivo" "sim"    sim
+  gemea_ok "$arquivo" "sí"     sim
   gemea_ok "$arquivo" "nao"    nao
   gemea_ok "$arquivo" ""       nao
 done
@@ -1670,7 +1721,13 @@ montar_vps() {
   # ele no sandbox, aquele `bash` falhava, o `|| true` engolia, e todo cenário
   # media uma instalação em que o passo dos e-mails de acesso simplesmente não
   # aconteceu — o elo mais fácil de quebrar sem ninguém ver.
-  cp install.sh update.sh backup.sh _common.sh marca-emails.sh "$raiz/"
+  # `manutencao.sh` e a pasta `manutencao/` entram pela MESMA razao, e a lista
+  # acima nasceu curta duas vezes: o `update.sh` os carrega com `source` DURO, no
+  # topo, igual ao `_common.sh`. Sem eles aqui, o script morre na LINHA 21 — antes
+  # de qualquer mensagem — e todo cenario reporta "o update.sh nao chegou ao
+  # banco / ao fim / ao up -d", que le como defeito do produto e e cenario faltando.
+  cp install.sh update.sh backup.sh _common.sh _i18n.sh marca-emails.sh manutencao.sh "$raiz/"
+  cp -R manutencao "$raiz/"
   : > "$VPS_PROJ/docker-compose.prod.yml"
   cat > "$raiz/bin/docker"
   # Só o v_supabase_url exige resposta online (000 reprova); os outros toleram.
@@ -2000,8 +2057,7 @@ echo "packaging: a instalação resolve a última versão publicada"
   git clone --quiet "$repo_falso/origem.git" "$trabalho/w" 2>/dev/null
   (
     cd "$trabalho/w" || exit 1
-    git config user.email t@t; git config user.name t
-    echo x > a; git add -A; git commit --quiet -m init
+    echo x > a; git add -A; git -c user.email=t@t -c user.name=t commit --quiet -m init
     for t in v1.0.0 v1.9.0 v1.10.0 v1.2.0; do git tag "$t"; done
     git push --quiet origin HEAD --tags 2>/dev/null
   )
@@ -2042,8 +2098,7 @@ TMP_PIN="$(mktemp -d)"
     cd "$TMP_PIN" || exit 1
     git clone --quiet "$origem" w 2>/dev/null
     cd w || exit 1
-    git config user.email t@t; git config user.name t
-    echo x > a; git add -A; git commit --quiet -m init
+    echo x > a; git add -A; git -c user.email=t@t -c user.name=t commit --quiet -m init
     for t in v1.0.0 v1.9.0 v1.10.0; do git tag "$t"; done
     git push --quiet origin HEAD --tags 2>/dev/null
   )
@@ -2087,6 +2142,23 @@ echo "packaging: a tag do git não basta — as imagens têm de existir"
 # GHCR nasce privado, e repositório público não muda isso.
 TMP_PRIV="$(mktemp -d)"
 (
+  # O remoto daqui é um FIXTURE local, como no teste de pinagem acima, e não o
+  # default do repositório. Enquanto o default apontava para o upstream (com
+  # tags), este caso dependia de rede e passava por acidente; num fork sem tag
+  # publicada a sonda de versão volta vazia, o install cai em `latest` e o aviso
+  # de build local nunca sai — o teste reprovava o fork por acidente de ambiente,
+  # não por defeito. Com o fixture a asserção é determinística.
+  origem="$TMP_PRIV/origem.git"
+  git init --quiet --bare "$origem"
+  (
+    cd "$TMP_PRIV" || exit 1
+    git clone --quiet "$origem" w 2>/dev/null
+    cd w || exit 1
+    echo x > a; git add -A; git -c user.email=t@t -c user.name=t commit --quiet -m init
+    git tag v1.0.0
+    git push --quiet origin HEAD --tags 2>/dev/null
+  )
+
   montar_vps "$TMP_PRIV/vps" "crmpriv" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$DOCKER_LOG"
@@ -2095,9 +2167,10 @@ case "$1" in
 esac
 exit 0
 STUB
+  export REPO_URL="$origem"
   export DUBLE_GHCR=403          # pacote existe mas está PRIVADO
   saida="$(rodar install.sh --yes)"
-  unset DUBLE_GHCR
+  unset DUBLE_GHCR REPO_URL
 
   if ! printf '%s' "$saida" | grep -q "construídas neste servidor"; then
     printf '  ✗ com as imagens inalcançáveis, o instalador não avisou que ia construir aqui\n'
@@ -3331,7 +3404,7 @@ TMP_SITEURL="$(mktemp -d)"
   mkdir -p "$TMP_SITEURL/../supabase/templates" 2>/dev/null
   # Os modelos moram em ../supabase/templates relativo ao script.
   mkdir -p "$TMP_SITEURL/kit" "$TMP_SITEURL/supabase/templates"
-  cp "$KIT_AQUI/marca-emails.sh" "$KIT_AQUI/_common.sh" "$TMP_SITEURL/kit/"
+  cp "$KIT_AQUI/marca-emails.sh" "$KIT_AQUI/_common.sh" "$KIT_AQUI/_i18n.sh" "$TMP_SITEURL/kit/"
   cp "$KIT_AQUI/../supabase/templates/confirmation.html" \
      "$KIT_AQUI/../supabase/templates/recovery.html" "$TMP_SITEURL/supabase/templates/" || exit 1
 
@@ -3420,7 +3493,7 @@ TMP_RASCUNHO="$(mktemp -d)"
 (
   KIT_AQUI="$PWD"
   cd "$TMP_RASCUNHO" || exit 1
-  cp "$KIT_AQUI/install.sh" "$KIT_AQUI/_common.sh" . || exit 1
+  cp "$KIT_AQUI/install.sh" "$KIT_AQUI/_common.sh" "$KIT_AQUI/_i18n.sh" . || exit 1
   INSTALL_SH_LIB=1 . ./install.sh >/dev/null 2>&1
   set +e   # o install.sh liga `set -e`; aqui as sondas precisam poder sair != 0
 

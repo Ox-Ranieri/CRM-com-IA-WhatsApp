@@ -81,6 +81,7 @@ export function PainelDeMarcacao({
   fusoSuposto = false,
   fontesDefasadas,
   googleCoberturaParcial,
+  onMesVisivel,
   quemSeraAtendido,
   horarioInicial,
   permiteEncaixe = false,
@@ -141,7 +142,15 @@ export function PainelDeMarcacao({
   /** O fuso veio do padrão, ninguém escolheu — e o agente oferece horário com ele. */
   fusoSuposto?: boolean;
   /** Agenda conectada que parou de atualizar: o horário fica bloqueado, e a tela diz desde quando. */
+  /** Ocupação do Google ainda não lida para o recorte pedido — aviso, não trava. */
   googleCoberturaParcial?: boolean;
+  /**
+   * O mês que o calendário está mostrando. Quem consulta os horários livres
+   * precisa disto: a busca acompanha o mês visível, senão "Próximo mês" ou
+   * entrega 42 dias mortos ou desliga para não produzir esse estado.
+   */
+  onMesVisivel?: (mes: Date) => void;
+  /** Agenda conectada que parou de atualizar: o horário fica bloqueado, e a tela diz desde quando. */
   fontesDefasadas?: Array<{ nome?: string; desde?: string }>;
   /**
    * Quem vai ser atendido, e se ele aceita receber mensagem.
@@ -211,6 +220,9 @@ export function PainelDeMarcacao({
   const [mes, setMes] = React.useState(() =>
     startOfMonth(horarioInicial ? new Date(horarioInicial.instante) : ancora),
   );
+  React.useEffect(() => {
+    onMesVisivel?.(mes);
+  }, [mes, onMesVisivel]);
   const [encaixeAberto, setEncaixeAberto] = React.useState(false);
   // O que a pessoa DIGITOU sobrevive a "Voltar", à troca de dia e à recusa do
   // servidor: quem ouviu "ocupado" quer corrigir dez minutos, não redigitar.
@@ -286,26 +298,11 @@ export function PainelDeMarcacao({
    *
    *   - instalação fresca: ninguém em `attendant_availability` ⇒ a rota devolve
    *     422 ⇒ o hook joga o erro num toast e `data` fica `undefined` ⇒ o
-   *     `?? true` do chamador diz "publicou" ⇒ 42 dias mortos, zero aviso;
-   *   - navegar para frente: a consulta pede 30 dias e o mês visível é estado
-   *     LOCAL deste painel. Dois cliques em "Próximo mês", numa organização
-   *     perfeitamente configurada, e a grade some — sem toast e sem aviso.
+   *     `?? true` do chamador diz "publicou" ⇒ 42 dias mortos, zero aviso.
    *
    * `nenhumDiaClicavel` é LITERALMENTE a expressão do `disponivel` de cada dia,
    * negada e universal. Por construção os dois não voltam a divergir.
    */
-  /**
-   * Existe algum dia CONSULTADO depois do mês visível?
-   *
-   * Deriva das chaves de `horariosPorDia`, que é o recorte que a consulta de
-   * fato cobriu — e não de uma constante de 30 dias copiada para cá, que
-   * envelheceria no dia em que a janela mudasse.
-   */
-  const temDiaConsultadoDepois = React.useMemo(() => {
-    const fimDoMes = startOfMonth(addDays(startOfMonth(mes), 32));
-    return Object.keys(horariosPorDia).some((chave) => new Date(`${chave}T12:00:00`) >= fimDoMes);
-  }, [horariosPorDia, mes]);
-
   const encaixeLigado = permiteEncaixe && Boolean(fuso) && publicouHorarios && !erroAoCarregar;
   const inicioDeHoje = startOfDay(agora).getTime();
 
@@ -557,10 +554,8 @@ export function PainelDeMarcacao({
         // colunas cabem com folga. Abaixo disso o painel EMPILHA — os horários
         // viram uma seção sob o calendário, que é o que o cal.com faz e o que
         // esta base já fazia no celular.
-        // `lg:min-h-0` junto do piso: em janela larga e BAIXA (menos de ~560px
-        // de altura) um `min-h-[450px]` sem teto estoura o Sheet e o
-        // `overflow-hidden` corta em silêncio — o mesmo modo de falha que este
-        // painel já teve na horizontal.
+        // `lg:min-h-0`: de `lg` para cima o painel tem a altura do conteúdo e
+        // quem rola é o Sheet (`_client.tsx`); o piso de 450px é do empilhado.
         "flex min-h-[450px] flex-col overflow-hidden rounded-lg border border-border bg-surface lg:min-h-0 lg:w-fit lg:flex-row",
         className,
       )}
@@ -598,24 +593,20 @@ export function PainelDeMarcacao({
       {/* CORPO — o mês. 420–480px é a faixa medida no cal.com; aqui ela é
           `min-width` e não largura fixa, porque no celular a coluna ocupa tudo. */}
       {/*
-        ⚠️ `lg:min-h-0 lg:overflow-y-auto` — A CONFIRMAÇÃO FICAVA FORA DO ALCANCE.
+        ⚠️ SEM rolagem própria — o corpo cresce e quem rola é o Sheet.
 
-        De `lg` para cima o painel tem a altura do Sheet, e o Sheet não rola
-        (`_client.tsx`). O corpo não tinha teto nem rolagem: mês + confirmação
-        passavam da caixa, e o `overflow-hidden` do painel cortava EM SILÊNCIO.
-        Medido em 2026-09-15 pela tela, com o bloco "Quem será atendido" acima:
-        o botão Confirmar começava em 840px numa janela de 800 (1280×800) e em
-        821px numa de 768 (1366×768), com o painel terminando em 776 e 744 —
-        inteiro fora da caixa, sem barra e sem como clicar. Em 1440×900 ele saía
-        cortado ao meio, e a recusa do servidor logo acima dele também.
-
-        Rolar o CORPO, e não o Sheet, pelo mesmo motivo que a lista rola sozinha:
-        o contexto e os horários ficam parados, e não nasce barra horizontal no
-        Sheet. Abaixo de `lg` nada muda — ali quem rola é o diálogo.
+        Em 2026-09-15 o Confirmar ficou fora da caixa (1280×800: começava em
+        840px) porque o painel tinha a altura do Sheet e o Sheet não rolava; o
+        remendo foi dar `lg:overflow-y-auto` a este corpo. Não bastou: a altura
+        que sobrava para o painel era o que o formulário acima deixava, e em
+        janela baixa (1280×500, 1024×560), pela conta das alturas do formulário,
+        isso é quase nada — o corpo rolava dentro de uma fresta. Agora o Sheet
+        rola (`_client.tsx`), e um segundo rolador aqui dentro só prenderia a
+        roda do mouse no de dentro.
       */}
       <div
         data-testid="corpo-da-marcacao"
-        className="flex min-w-0 flex-1 flex-col p-4 lg:min-h-0 lg:min-w-[420px] lg:overflow-y-auto"
+        className="flex min-w-0 flex-1 flex-col p-4 lg:min-w-[420px]"
       >
         <div className="mb-3 flex items-center justify-between">
           <span className="text-sm font-semibold first-letter:uppercase">
@@ -636,15 +627,6 @@ export function PainelDeMarcacao({
               size="icon"
               aria-label={t("Próximo mês")}
               data-testid="mes-seguinte"
-              // NÃO leva a um mês que a consulta nunca cobriu.
-              //
-              // O mês visível é estado LOCAL deste painel e navegar não
-              // reconsulta nada: a busca pede 30 dias a partir de hoje. Dois
-              // cliques aqui, numa organização perfeitamente configurada,
-              // entregavam 42 dias mortos sem toast e sem aviso. O bloco de
-              // motivo acima já explica quando acontece; desabilitar evita
-              // PRODUZIR o estado, que é melhor que explicá-lo.
-              disabled={!temDiaConsultadoDepois}
               onClick={() => setMes((m) => startOfMonth(addDays(startOfMonth(m), 32)))}
             >
               <CaretRight size={16} weight="bold" aria-hidden />
@@ -719,9 +701,7 @@ export function PainelDeMarcacao({
               {t("Nenhum horário livre em")} {format(mes, "MMMM", { locale: localeDaData })}
             </p>
             <p className="mt-1 text-xs leading-4 text-text-muted">
-              {t(
-                "Os próximos 30 dias são o que está publicado hoje — meses adiante aparecem conforme a data se aproxima.",
-              )}
+              {t("Não há horário livre publicado neste mês.")}
             </p>
           </div>
         )}

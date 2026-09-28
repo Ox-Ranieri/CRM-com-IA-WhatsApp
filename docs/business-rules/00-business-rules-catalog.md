@@ -172,7 +172,7 @@ owner: Rafael Melgaço
 - **Tipo**: Hard constraint
 - **Regra**: GIVEN mensagem inbound text; WHEN `ehPedidoDeOptOut(body)` — **palavra ISOLADA** (mensagem inteira = a palavra) **ou** verbo de cessação com **objeto de comunicação** ("parar de me mandar", "sair da lista", "cancelar inscrição"); THEN `contacts.is_blocked=true` + emitir activity `system.contact_blocked_by_stop`.
 - **Por que deixou de ser regex de palavra solta** (2026-08-21): caçar a PALAVRA em qualquer posição bloqueava frase inocente na INGESTÃO, antes do modelo — e o bloqueio some a pessoa da conversa sem ninguém saber, com `blocked_reason='stop_keyword'` parecendo legítimo. Medido num corpus de 79 frases: a regra antiga produzia **12 falsos positivos** de nicho ("tem como parar a dor?", "posso sair antes das 15h?", "preciso sair mais cedo da consulta") e deixava passar **21 de 33 pedidos reais** ("não quero mais receber nada", "me tira da lista", "cancelar inscrição"). A regra nova: 0 falsos positivos, 33 de 33 pedidos.
-- **Onde ela mora, para não envelhecer aqui**: `lib/opt-out/deteccao.ts`. O vocabulário em vigor sai de `grep -n 'PALAVRAS_DE_OPT_OUT' -A20 lib/opt-out/deteccao.ts`; as frases de controle, de `tests/unit/opt-out-deteccao.test.ts`.
+- **Onde ela mora, para não envelhecer aqui**: `lib/opt-out/deteccao.ts`. O vocabulário em vigor sai de `sed -n '/PALAVRAS_DE_OPT_OUT/,/^]/p' lib/opt-out/deteccao.ts | grep -E '^ *"'`; as frases de controle, de `tests/unit/opt-out-deteccao.test.ts`.
 - **Dois níveis, e a diferença importa**: `ehPedidoDeOptOut` (inequívoco) autoriza gravar `is_blocked`, que só uma pessoa desfaz. `ehOptOutProvavel` soma os ambíguos ("me deixa em paz") e é o sinal do runtime — para de responder e escala à Central, **sem** bloquear.
 - **Espanhol é coberto, nos dois níveis** (vocabulário inequívoco no PR #275; camada ambígua e construções com pronome preso — `escribirme`, `mandarme` — no PR #416, de @JowaniOrantes).
 
@@ -485,6 +485,7 @@ owner: Rafael Melgaço
 - **Regra**: GIVEN mídia em `whatsapp-media` bucket; WHEN `created_at < now() - tenant.media_retention_days` (default 365); THEN cron `prune-old-media` move pra cold storage S3 (ou deleta se `tenant.cold_storage_disabled=true`).
 - **Enforcement**: Cron diário.
 - **Override**: Tenant pode aumentar retenção (paga storage extra) ou diminuir (mín 90d em modo BPO; sem mín em modo SaaS futuro).
+- **Estado**: cumprida desde a migration 0432, **sem camada cold/S3** — o arquivo vencido é removido (a mensagem fica, com «Mídia indisponível»), com piso de 30 dias, o mesmo do formulário. Junto sai o arquivo órfão de conversa apagada. Quem enfileira é `fn_enfileirar_midia_vencida`, chamada pelo cron `media-retention`; quem remove é o `storage-redaction`, pela `storage_redaction_queue`. Para ver o horário em vigor: `grep -n media-retention docker/scheduler/entrypoint.sh`.
 
 ### B-04 — Quota de chamadas API por tenant: 100 RPS no MVP
 - **Origem**: Sub-PRD 01 §4.2

@@ -10,6 +10,7 @@ import {
   type NoDoDossie,
 } from "./eventos-legiveis";
 import type { FlowNode } from "./graph-schema";
+import { EVENTO_ACAO_ADIADA } from "./node-handlers";
 
 const espera: FlowNode = {
   id: "wait-1",
@@ -132,6 +133,25 @@ describe("descreveEvento", () => {
   it("intervenção humana é marcada como humana — é o que separa decisão de automatismo", () => {
     expect(descreveEvento(evento({ event_type: "paused_manual" }), nos, "pt-BR").autor).toBe("pessoa");
     expect(descreveEvento(evento({ event_type: "reactivity_replied" }), nos, "pt-BR").autor).toBe("cliente");
+  });
+
+  it("adiar por janela fechada é lido como ESPERA, não como defeito — e com a data", () => {
+    // Sem esta linha, o passo mais longo do dossiê (horas, às vezes dias) cai no
+    // `default` e aparece como "código: action_deferred". Quem abre o dossiê para
+    // entender por que o cliente não recebeu lê defeito onde houve obediência ao
+    // horário que ele mesmo configurou.
+    const r = descreveEvento(
+      evento({
+        node_id: "action-1",
+        event_type: EVENTO_ACAO_ADIADA,
+        payload: { until: "2026-08-11T12:00:00.000Z", reason: "outside_window" },
+      }),
+      nos,
+      "pt-BR",
+    );
+    expect(r.titulo).toBe("Segurou o envio até o horário permitido");
+    expect(r.detalhe).toContain("envia em");
+    expect(r.autor).toBe("motor");
   });
 
   it("tipo desconhecido não vira jargão disfarçado de frase, mas também não some", () => {
@@ -332,5 +352,17 @@ describe("os eventos que o plano de tempo trouxe", () => {
     const r = descreveEvento(evento({ event_type: "timing_plan_desistido" }), nos, "pt-BR");
     expect(r.titulo).toBe("Seguiu sem o plano de tempo");
     expect(r.detalhe).toContain("máximo configurado");
+  });
+
+  it("nascimento do negócio é proveniência, não código cru", () => {
+    const r = descreveEvento(evento({ event_type: "enrolled_by_lead_created" }), nos, "pt-BR");
+    expect(r.titulo).toBe("Começou porque o negócio nasceu");
+    expect(r.autor).toBe("motor");
+  });
+
+  it("retorno do cliente é proveniência, não código cru", () => {
+    const r = descreveEvento(evento({ event_type: "enrolled_by_inbound_after_silence" }), nos, "pt-BR");
+    expect(r.titulo).toBe("Começou porque o cliente voltou a escrever");
+    expect(r.autor).toBe("motor");
   });
 });
